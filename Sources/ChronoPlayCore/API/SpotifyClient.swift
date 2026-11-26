@@ -70,7 +70,7 @@ public final class SpotifyClient: Sendable {
             }
 
             let (data, response) = try await session.data(for: request)
-            let http = response as! HTTPURLResponse
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
 
             switch http.statusCode {
             case 200..<300:
@@ -97,7 +97,8 @@ public final class SpotifyClient: Sendable {
         let body = try? JSONDecoder().decode(Body.self, from: data)
         return SpotifyAPIError(
             status: status,
-            message: body?.error.message ?? String(decoding: data, as: UTF8.self),
+            // 解析不了就不要把原始內容放進給使用者看的錯誤訊息。
+            message: body?.error.message ?? "無法解析的回應（\(data.count) bytes）",
             reason: body?.error.reason
         )
     }
@@ -112,6 +113,10 @@ public final class SpotifyClient: Sendable {
         while let url = next {
             let page = try await get(url, as: Paging<Item>.self)
             items += page.items
+            // 只跟進 Spotify API 本身的網址，避免把 Bearer token 送到別的主機。
+            if let url = page.next, url.scheme != "https" || url.host() != Self.baseURL.host() {
+                throw URLError(.badServerResponse)
+            }
             next = page.next
         }
         return items

@@ -20,8 +20,13 @@ public struct Tokens: Codable, Sendable, Equatable {
 
 public protocol TokenStore: Sendable {
     func load() -> Tokens?
-    func save(_ tokens: Tokens)
+    func save(_ tokens: Tokens) throws
     func clear()
+}
+
+public struct KeychainError: LocalizedError {
+    public let status: OSStatus
+    public var errorDescription: String? { "無法把登入資訊存進 Keychain（OSStatus \(status)）。" }
 }
 
 /// 把 token 存在使用者的 Keychain（login keychain）。
@@ -52,14 +57,19 @@ public struct KeychainTokenStore: TokenStore {
         return try? JSONDecoder().decode(Tokens.self, from: data)
     }
 
-    public func save(_ tokens: Tokens) {
-        guard let data = try? JSONEncoder().encode(tokens) else { return }
-        let update = [kSecValueData as String: data]
-        if SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary) == errSecItemNotFound {
-            var add = baseQuery
-            add[kSecValueData as String] = data
-            SecItemAdd(add as CFDictionary, nil)
+    public func save(_ tokens: Tokens) throws {
+        let data = try JSONEncoder().encode(tokens)
+        // 只在解鎖時可讀，且不跟著備份／移轉到別台機器。
+        let update: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        var status = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            let add = baseQuery.merging(update) { $1 }
+            status = SecItemAdd(add as CFDictionary, nil)
         }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
     }
 
     public func clear() {

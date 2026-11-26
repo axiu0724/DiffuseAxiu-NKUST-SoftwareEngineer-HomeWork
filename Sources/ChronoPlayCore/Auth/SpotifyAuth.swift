@@ -92,7 +92,7 @@ public actor TokenManager {
             "client_id": clientID,
             "code_verifier": pkce.verifier,
         ], previousRefreshToken: nil)
-        set(tokens)
+        try set(tokens)
     }
 
     public func validAccessToken() async throws -> String {
@@ -113,9 +113,9 @@ public actor TokenManager {
         store.clear()
     }
 
-    private func set(_ tokens: Tokens) {
+    private func set(_ tokens: Tokens) throws {
         self.tokens = tokens
-        store.save(tokens)
+        try store.save(tokens)
     }
 
     private func refresh() async throws -> Tokens {
@@ -136,7 +136,7 @@ public actor TokenManager {
             let new = try await task.value
             // 等待回應的期間使用者登出了：丟掉這組 token，不要寫回 Keychain。
             guard generation == startGeneration else { throw SpotifyAuthError.notLoggedIn }
-            set(new)
+            try set(new)
             return new
         } catch SpotifyAuthError.tokenRequestFailed(let status, let body) where status == 400 {
             // refresh token 失效（例如使用者撤銷授權）：清掉，請使用者重新登入。
@@ -154,7 +154,7 @@ public actor TokenManager {
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else {
-            throw SpotifyAuthError.tokenRequestFailed(status, String(decoding: data, as: UTF8.self))
+            throw SpotifyAuthError.tokenRequestFailed(status, Self.errorSummary(data))
         }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -167,6 +167,17 @@ public actor TokenManager {
             refreshToken: refreshToken,
             expiresAt: Date.now.addingTimeInterval(TimeInterval(body.expiresIn))
         )
+    }
+
+    /// 只取 OAuth 錯誤回應的 error／error_description，不把原始 body 放進錯誤訊息。
+    static func errorSummary(_ data: Data) -> String {
+        struct Body: Decodable { let error: String; let errorDescription: String? }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let body = try? decoder.decode(Body.self, from: data) else {
+            return "無法解析的回應（\(data.count) bytes）"
+        }
+        return body.errorDescription.map { "\(body.error)：\($0)" } ?? body.error
     }
 
     static func formEncode(_ form: [String: String]) -> String {

@@ -71,6 +71,8 @@ public actor TokenManager {
     private let session: URLSession
     private var tokens: Tokens?
     private var refreshTask: Task<Tokens, Error>?
+    /// 每次登出就加一。refresh 送出後若已登出，回來的 token 不能再存回去。
+    private var generation = 0
 
     public init(clientID: String, store: any TokenStore, session: URLSession = .shared) {
         self.clientID = clientID
@@ -105,6 +107,8 @@ public actor TokenManager {
     }
 
     public func logout() {
+        generation += 1
+        refreshTask = nil
         tokens = nil
         store.clear()
     }
@@ -126,14 +130,17 @@ public actor TokenManager {
             ], previousRefreshToken: current.refreshToken)
         }
         refreshTask = task
-        defer { refreshTask = nil }
+        let startGeneration = generation
+        defer { if generation == startGeneration { refreshTask = nil } }
         do {
             let new = try await task.value
+            // 等待回應的期間使用者登出了：丟掉這組 token，不要寫回 Keychain。
+            guard generation == startGeneration else { throw SpotifyAuthError.notLoggedIn }
             set(new)
             return new
         } catch SpotifyAuthError.tokenRequestFailed(let status, let body) where status == 400 {
             // refresh token 失效（例如使用者撤銷授權）：清掉，請使用者重新登入。
-            logout()
+            if generation == startGeneration { logout() }
             throw SpotifyAuthError.tokenRequestFailed(status, body)
         }
     }

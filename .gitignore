@@ -1,1 +1,6 @@
 .DS_Store
+
+# Swift Package 建置產物（全部留在專案資料夾內）
+.build/
+.swiftpm/
+build/

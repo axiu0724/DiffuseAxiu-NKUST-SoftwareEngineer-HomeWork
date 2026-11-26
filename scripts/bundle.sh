@@ -17,8 +17,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/ChronoPlay" "$APP/Contents/MacOS/ChronoPlay"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
-# ad-hoc 簽章（不需要 Apple Developer 帳號），macOS 才允許執行並使用 Keychain
-codesign --force --sign - "$APP"
+# ad-hoc 簽章（不需要 Apple Developer 帳號），macOS 才允許執行並使用 Keychain。
+# 預設的 ad-hoc 簽章每次編譯都會變，Keychain 就會每次都詢問是否允許讀取 token。
+# 這裡把「身分」固定成 bundle id，只要第一次選「永遠允許」，之後重新編譯就不會再問。
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Resources/Info.plist)"
+codesign --force --sign - -r="designated => identifier \"$BUNDLE_ID\"" "$APP"
 
 echo "完成：$APP"
 echo "執行：open $APP"

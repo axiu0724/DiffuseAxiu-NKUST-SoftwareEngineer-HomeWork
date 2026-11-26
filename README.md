@@ -106,4 +106,4 @@ Spotify 的 `PUT /me/player/play` 可以送出一串歌曲 URI。但這串歌播
 - 要接上第一段之後的歌，ChronoPlay 必須保持開著。放在背景也可以。
 - 播放中途如果在官方 app 手動加入佇列，那些歌會插進播放順序。
 - 播放是遙控 Spotify Connect 裝置，所以聲音從那個裝置出來，不是從 ChronoPlay 本身。macOS 沒有 Spotify 原生播放 SDK。
-- app 使用 ad-hoc 簽章。每次重新打包後，第一次讀取 Keychain 時 macOS 可能會詢問是否允許，選「永遠允許」即可。
+- app 使用 ad-hoc 簽章，並把簽章身分固定為 bundle id（見 `scripts/bundle.sh`）。第一次讀取 Keychain 時 macOS 會詢問是否允許，選「永遠允許」後，之後重新打包就不會再問。代價是：任何用同一個 bundle id 簽章的程式都能讀到這組 token，這只適合開發與作業用途。

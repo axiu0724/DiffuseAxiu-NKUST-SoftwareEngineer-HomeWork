@@ -112,10 +112,10 @@ private struct PlaybackProgress: View {
             let duration = Double(player.state?.item?.durationMs ?? 0) / 1000
             let elapsed = estimatedElapsed(at: context.date)
             HStack(spacing: 8) {
-                Text(Self.format(elapsed)).monospacedDigit()
+                Text(Self.format(elapsed)).monospacedDigit().fixedSize()
                 ProgressView(value: min(elapsed, duration), total: max(duration, 1))
                     .frame(width: 140)
-                Text(Self.format(duration)).monospacedDigit()
+                Text(Self.format(duration)).monospacedDigit().fixedSize()
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -149,6 +149,7 @@ private struct SequenceStatus: View {
             case .playing:
                 Label("第 \(plan.currentIndex + 1) / \(plan.uris.count) 首", systemImage: "list.number")
                     .font(.caption.monospacedDigit())
+                    .fixedSize()
                     .foregroundStyle(.secondary)
                     .help("連續播放中：會依時間順序一路播完")
             case .detached:

@@ -26,7 +26,17 @@ public struct SpotifyAuthConfig: Sendable {
         "user-read-playback-state",
         "user-modify-playback-state",
         "user-read-currently-playing",
+        // 讀取自己的播放清單與已按讚的歌曲（顯示清單、標示歌曲已收藏）
+        "playlist-read-private",
+        "playlist-read-collaborative",
+        "user-library-read",
     ]
+
+    /// 已授權的 scope 是否涵蓋目前需要的全部。不知道（舊版 token）時視為不足。
+    public static func covers(_ granted: Set<String>?) -> Bool {
+        guard let granted else { return false }
+        return Set(scopes).isSubset(of: granted)
+    }
 
     public let clientID: String
 
@@ -64,6 +74,7 @@ public actor TokenManager {
         let accessToken: String
         let expiresIn: Int
         let refreshToken: String?
+        let scope: String?
     }
 
     private let clientID: String
@@ -83,6 +94,8 @@ public actor TokenManager {
 
     public var isLoggedIn: Bool { tokens != nil }
 
+    public var grantedScopes: Set<String>? { tokens?.grantedScopes }
+
     /// 用授權碼換第一組 token。
     public func exchange(code: String, pkce: PKCE) async throws {
         let tokens = try await requestTokens([
@@ -91,7 +104,7 @@ public actor TokenManager {
             "redirect_uri": SpotifyAuthConfig.redirectURI,
             "client_id": clientID,
             "code_verifier": pkce.verifier,
-        ], previousRefreshToken: nil)
+        ], previous: nil)
         try set(tokens)
     }
 
@@ -127,7 +140,7 @@ public actor TokenManager {
                 "grant_type": "refresh_token",
                 "refresh_token": current.refreshToken,
                 "client_id": clientID,
-            ], previousRefreshToken: current.refreshToken)
+            ], previous: current)
         }
         refreshTask = task
         let startGeneration = generation
@@ -145,7 +158,7 @@ public actor TokenManager {
         }
     }
 
-    private func requestTokens(_ form: [String: String], previousRefreshToken: String?) async throws -> Tokens {
+    private func requestTokens(_ form: [String: String], previous: Tokens?) async throws -> Tokens {
         var request = URLRequest(url: URL(string: "https://accounts.spotify.com/api/token")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -159,13 +172,15 @@ public actor TokenManager {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let body = try decoder.decode(TokenResponse.self, from: data)
-        guard let refreshToken = body.refreshToken ?? previousRefreshToken else {
+        guard let refreshToken = body.refreshToken ?? previous?.refreshToken else {
             throw SpotifyAuthError.tokenRequestFailed(status, "回應中沒有 refresh_token")
         }
         return Tokens(
             accessToken: body.accessToken,
             refreshToken: refreshToken,
-            expiresAt: Date.now.addingTimeInterval(TimeInterval(body.expiresIn))
+            expiresAt: Date.now.addingTimeInterval(TimeInterval(body.expiresIn)),
+            // refresh 的回應沒有 scope 時沿用原本的
+            scope: body.scope ?? previous?.scope
         )
     }
 

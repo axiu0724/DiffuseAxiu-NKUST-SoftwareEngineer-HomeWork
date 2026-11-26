@@ -22,32 +22,21 @@ struct ArtistDetailView: View {
                     ForEach(Self.groupByYear(entries), id: \.year) { group in
                         Section(group.year) {
                             ForEach(group.rows, id: \.entry.id) { row in
-                                TrackRow(index: row.index, entry: row.entry, isCurrent: row.entry.id == currentID)
-                                    .tag(row.entry.id)
+                                TrackRow(
+                                    index: row.index, entry: row.entry,
+                                    isCurrent: row.entry.id == currentID,
+                                    locations: model.locations(of: row.entry)
+                                )
+                                .tag(row.entry.id)
                             }
                         }
                     }
                 }
                 .listStyle(.inset)
-                .contextMenu(forSelectionType: DiscographyEntry.ID.self) { ids in
-                    if let entry = entry(for: ids, in: entries) {
-                        Button("從這首開始連續播放", systemImage: "play.fill") {
-                            Task { await model.play(from: entry) }
-                        }
-                    }
-                } primaryAction: { ids in
-                    // 雙擊或按 Return：從這首開始播
-                    if let entry = entry(for: ids, in: entries) {
-                        Task { await model.play(from: entry) }
-                    }
-                }
+                .playOnActivate(entries: entries, model: model)
             }
         }
         .navigationTitle(model.selectedArtist?.name ?? "")
-    }
-
-    private func entry(for ids: Set<DiscographyEntry.ID>, in entries: [DiscographyEntry]) -> DiscographyEntry? {
-        entries.first { ids.contains($0.id) }
     }
 
     struct YearGroup {
@@ -158,111 +147,5 @@ private struct LoadingView: View {
         }
         .foregroundStyle(.secondary)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-// MARK: - 曲目列
-
-private enum Column {
-    static let index: CGFloat = 44
-    static let album: CGFloat = 220
-    static let date: CGFloat = 92
-    static let kind: CGFloat = 52
-    static let duration: CGFloat = 48
-}
-
-private struct TrackColumnsHeader: View {
-    var body: some View {
-        HStack(spacing: 12) {
-            Text("#").frame(width: Column.index, alignment: .trailing)
-            Text("曲名").frame(maxWidth: .infinity, alignment: .leading)
-            Text("專輯").frame(width: Column.album, alignment: .leading)
-            Text("發行日期").frame(width: Column.date, alignment: .leading)
-            Text("類型").frame(width: Column.kind, alignment: .leading)
-            Image(systemName: "clock").frame(width: Column.duration, alignment: .trailing)
-        }
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 24)
-        .padding(.vertical, 6)
-    }
-}
-
-private struct TrackRow: View {
-    let index: Int
-    let entry: DiscographyEntry
-    let isCurrent: Bool
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Group {
-                if isCurrent {
-                    Image(systemName: "speaker.wave.2.fill")
-                        .foregroundStyle(.tint)
-                        .symbolEffect(.variableColor.iterative)
-                } else {
-                    Text("\(index + 1)")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .monospacedDigit()
-            .frame(width: Column.index, alignment: .trailing)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(entry.track.name)
-                    .fontWeight(isCurrent ? .semibold : .regular)
-                    .foregroundStyle(isCurrent ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
-                    .lineLimit(1)
-                Text(entry.track.artists.map(\.name).joined(separator: ", "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Text(entry.album.name)
-                .lineLimit(1)
-                .frame(width: Column.album, alignment: .leading)
-                .help(entry.album.name)
-
-            Text(entry.release.description)
-                .monospacedDigit()
-                .frame(width: Column.date, alignment: .leading)
-
-            KindBadge(kind: entry.kind)
-                .frame(width: Column.kind, alignment: .leading)
-
-            Text(Self.format(ms: entry.track.durationMs))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .frame(width: Column.duration, alignment: .trailing)
-        }
-        .padding(.vertical, 2)
-    }
-
-    static func format(ms: Int) -> String {
-        let seconds = ms / 1000
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
-    }
-}
-
-private struct KindBadge: View {
-    let kind: ReleaseKind
-
-    var body: some View {
-        Text(kind.shortLabel)
-            .font(.caption2.weight(.medium))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .foregroundStyle(color)
-            .background(color.opacity(0.15), in: .capsule)
-    }
-
-    private var color: Color {
-        switch kind {
-        case .album: .blue
-        case .single: .green
-        case .appearsOn: .orange
-        }
     }
 }

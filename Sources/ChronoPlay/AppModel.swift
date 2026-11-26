@@ -4,7 +4,14 @@ import ChronoPlayCore
 import Observation
 import SwiftUI
 
-/// 整個 app 的狀態：登入、搜尋、藝人作品時間軸、裝置，以及連續播放控制器。
+/// 側邊欄選到的項目。
+enum SidebarItem: Hashable {
+    case artist(Artist.ID)
+    case likedSongs
+    case playlist(Playlist.ID)
+}
+
+/// 整個 app 的狀態：登入、搜尋、藝人作品時間軸、播放清單、裝置，以及連續播放控制器。
 @MainActor
 @Observable
 final class AppModel {
@@ -44,8 +51,11 @@ final class AppModel {
     var hasPendingSearch: Bool {
         isSearching || searchText.trimmingCharacters(in: .whitespaces) != lastSearchedQuery
     }
+    var selection: SidebarItem? {
+        didSet { if selection != oldValue { Task { await selectionChanged() } } }
+    }
     var selectedArtistID: Artist.ID? {
-        didSet { if selectedArtistID != oldValue { Task { await loadSelectedArtist() } } }
+        if case .artist(let id) = selection { id } else { nil }
     }
     private(set) var selectedArtist: Artist?
     /// 目前藝人的完整時間軸（所有類型），用 enabledKinds 在本機過濾
@@ -54,6 +64,22 @@ final class AppModel {
     private(set) var loadingProgress: (done: Int, total: Int)?
     private var timelineCache: [Artist.ID: [DiscographyEntry]] = [:]
     private var loadTask: Task<Void, Never>?
+
+    // MARK: 播放清單與已按讚的歌曲
+
+    /// 歌曲存在哪些清單
+    private(set) var library = LibraryIndex()
+    /// 每個可讀清單的內容（依清單原本的順序）
+    private(set) var playlistEntries: [Playlist.ID: [DiscographyEntry]] = [:]
+    /// 已按讚的歌曲（第一次打開時才讀取，可能有上千首）
+    private(set) var likedEntries: [DiscographyEntry]?
+    private(set) var isLoadingLiked = false
+    /// 讀取清單中的進度；nil 代表沒有在讀取
+    private(set) var libraryProgress: (done: Int, total: Int)?
+    /// 目前的登入沒有讀取清單的權限（舊版登入），需要重新登入
+    private(set) var needsLibraryAuthorization = false
+    private var libraryTask: Task<Void, Never>?
+    private var likedTask: Task<Void, Never>?
 
     // MARK: 裝置與錯誤
 
@@ -82,6 +108,24 @@ final class AppModel {
 
     var visibleTimeline: [DiscographyEntry] {
         timeline.filter { enabledKinds.contains($0.kind) }
+    }
+
+    /// 目前畫面上的歌曲清單，也是按下播放時要連續播放的那一份
+    var currentEntries: [DiscographyEntry] {
+        switch selection {
+        case .artist: visibleTimeline
+        case .likedSongs: likedEntries ?? []
+        case .playlist(let id): playlistEntries[id] ?? []
+        case nil: []
+        }
+    }
+
+    func playlist(id: Playlist.ID) -> Playlist? {
+        library.playlists.first { $0.id == id }
+    }
+
+    func locations(of entry: DiscographyEntry) -> [SavedLocation] {
+        library.locations(of: entry.track.uri)
     }
 
     var hasClientID: Bool { !clientID.isEmpty }
@@ -132,6 +176,7 @@ final class AppModel {
         isLoggedIn = true
         player.startPolling()
         Task { await refreshDevices() }
+        Task { await refreshLibrary() }
     }
 
     func logout() {
@@ -141,11 +186,19 @@ final class AppModel {
         tokenStore.clear()
         isLoggedIn = false
         searchResults = []
-        selectedArtistID = nil
+        selection = nil
         selectedArtist = nil
         timeline = []
         timelineCache = [:]
         devices = []
+        libraryTask?.cancel()
+        likedTask?.cancel()
+        library = LibraryIndex()
+        playlistEntries = [:]
+        likedEntries = nil
+        isLoadingLiked = false
+        libraryProgress = nil
+        needsLibraryAuthorization = false
     }
 
     // MARK: - 搜尋
@@ -169,6 +222,19 @@ final class AppModel {
         }
     }
 
+    // MARK: - 選取項目
+
+    private func selectionChanged() async {
+        switch selection {
+        case .artist, nil:
+            await loadSelectedArtist()
+        case .likedSongs:
+            await loadLikedIfNeeded()
+        case .playlist(let id):
+            await checkLiked(playlistEntries[id] ?? [])
+        }
+    }
+
     // MARK: - 作品時間軸
 
     private func loadSelectedArtist() async {
@@ -182,6 +248,7 @@ final class AppModel {
         if let cached = timelineCache[id] {
             timeline = cached
             loadingProgress = nil
+            await checkLiked(cached)
             return
         }
 
@@ -205,6 +272,7 @@ final class AppModel {
                 if selectedArtistID == id {
                     timeline = entries
                     loadingProgress = nil
+                    await checkLiked(entries)
                 }
             } catch is CancellationError {
             } catch {
@@ -222,10 +290,90 @@ final class AppModel {
         await loadSelectedArtist()
     }
 
+    // MARK: - 播放清單與已按讚的歌曲
+
+    /// 重新讀取所有清單。已按讚的狀態也一併清掉重查，因為可能在官方 app 改過。
+    func refreshLibrary() async {
+        guard isLoggedIn else { return }
+        needsLibraryAuthorization = !SpotifyAuthConfig.covers(await tokens.grantedScopes)
+        guard !needsLibraryAuthorization else { return }
+
+        libraryTask?.cancel()
+        likedTask?.cancel()
+        library = LibraryIndex()
+        likedEntries = nil
+        isLoadingLiked = false
+        libraryProgress = (0, 0)
+
+        let task = Task { [client] in
+            do {
+                let contents = try await LibraryLoader.loadPlaylists(api: client, progress: { done, total in
+                    Task { @MainActor in
+                        if self.libraryProgress != nil { self.libraryProgress = (done, total) }
+                    }
+                })
+                try Task.checkCancellation()
+                library.setPlaylists(contents.playlists, unreadable: contents.unreadable, contents: contents.uris)
+                playlistEntries = contents.items.mapValues(PlaylistEntries.make)
+                libraryProgress = nil
+            } catch is CancellationError {
+            } catch {
+                libraryProgress = nil
+                report(error)
+            }
+        }
+        libraryTask = task
+        await task.value
+        if !task.isCancelled { await refreshSavedStatusOnScreen() }
+    }
+
+    /// 重新查目前畫面上歌曲的已按讚狀態（打開的是已按讚的歌曲時，改成重新讀取它）。
+    private func refreshSavedStatusOnScreen() async {
+        switch selection {
+        case .artist: await checkLiked(timeline)
+        case .likedSongs: await loadLikedIfNeeded()
+        case .playlist(let id): await checkLiked(playlistEntries[id] ?? [])
+        case nil: break
+        }
+    }
+
+    func loadLikedIfNeeded() async {
+        guard isLoggedIn, !needsLibraryAuthorization, likedEntries == nil, !isLoadingLiked else { return }
+        isLoadingLiked = true
+        let task = Task { [client] in
+            do {
+                let items = try await client.likedItems()
+                try Task.checkCancellation()
+                likedEntries = PlaylistEntries.make(items)
+                library.replaceLiked(with: Set(items.compactMap { $0.track?.track.uri }))
+            } catch is CancellationError {
+            } catch {
+                report(error)
+            }
+            isLoadingLiked = false
+        }
+        likedTask = task
+        await task.value
+    }
+
+    /// 查詢還不知道是否已按讚的歌曲。
+    private func checkLiked(_ entries: [DiscographyEntry]) async {
+        guard isLoggedIn, !needsLibraryAuthorization else { return }
+        let unknown = entries.map(\.track.uri).filter { !library.isLikedKnown($0) }
+        guard !unknown.isEmpty else { return }
+        do {
+            let status = try await LibraryLoader.likedStatus(of: unknown, api: client)
+            library.setLiked(status)
+        } catch is CancellationError {
+        } catch {
+            report(error)
+        }
+    }
+
     // MARK: - 播放
 
     func play(from entry: DiscographyEntry? = nil) async {
-        let list = visibleTimeline
+        let list = currentEntries
         guard !list.isEmpty else { return }
         let index = entry.flatMap { e in list.firstIndex { $0.id == e.id } } ?? 0
         await player.start(entries: list, at: index, windowSize: windowSize)
@@ -274,6 +422,10 @@ final class AppModel {
         } else if case SpotifyAuthError.tokenRequestFailed = error {
             isLoggedIn = false
             player.stopPolling()
+        } else if let error = error as? SpotifyAPIError, error.status == 403, error.message.lowercased().contains("scope") {
+            // 登入時沒有授權讀取清單：請使用者重新登入，不跳錯誤視窗
+            needsLibraryAuthorization = true
+            return
         }
         errorMessage = error.localizedDescription
     }

@@ -5,11 +5,19 @@ public struct Tokens: Codable, Sendable, Equatable {
     public var accessToken: String
     public var refreshToken: String
     public var expiresAt: Date
+    /// 授權的 scope（以空白分隔）。舊版存下來的 token 沒有這個欄位，會是 nil。
+    public var scope: String?
 
-    public init(accessToken: String, refreshToken: String, expiresAt: Date) {
+    public init(accessToken: String, refreshToken: String, expiresAt: Date, scope: String? = nil) {
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.expiresAt = expiresAt
+        self.scope = scope
+    }
+
+    /// 已授權的 scope；不知道時是 nil。
+    public var grantedScopes: Set<String>? {
+        scope.map { Set($0.split(separator: " ").map(String.init)) }
     }
 
     /// 提早 60 秒視為過期，避免請求途中失效。

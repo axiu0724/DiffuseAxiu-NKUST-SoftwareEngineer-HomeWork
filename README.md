@@ -73,6 +73,14 @@ scripts/test.sh --filter "SequencePlanTests/queuesAtWindowEnd"
 4. 底部的玻璃播放列會顯示目前播到第幾首、所屬專輯和發行日期。
 5. 右上角可以選擇要在哪個裝置播放。如果找不到裝置，先打開官方 Spotify app。
 
+### 我的播放清單
+
+- 左側「我的播放清單」列出「已按讚的歌曲」和你的播放清單。點進去會依清單原本的順序列出歌曲，可以按「依清單順序播放」，或雙擊任一首從那裡開始播。
+- 已經收藏的歌曲，在時長前面會有綠色打勾，跟官方 app 一樣。按一下打勾會列出它在哪些清單，點清單名稱可以直接前往。
+  - 比對方式和官方 app 相同，看的是那一首歌本身：同一首歌的原版和豪華版是不同的歌，會各自判斷。
+- 在官方 app 改了清單之後，按「我的播放清單」旁的重新整理按鈕更新。
+- 從舊版升級時，側邊欄會出現「重新登入 Spotify」。這是因為讀取清單需要新的權限，重新登入一次就好。
+
 ## 運作原理
 
 ```
@@ -80,6 +88,7 @@ Sources/ChronoPlayCore/   不含 UI 的邏輯（有單元測試）
   Auth/                   PKCE 登入、Keychain 存 token、自動 refresh
   API/                    Spotify Web API client（處理 401、429、分頁）
   Discography/            抓作品、過濾客串曲目、依時間排序
+  Library/                讀取播放清單與已按讚的歌曲、建立「歌曲在哪些清單」的索引
   Playback/               連續播放引擎
 Sources/ChronoPlay/       SwiftUI 介面（Liquid Glass）
 Tests/ChronoPlayCoreTests/
@@ -100,6 +109,8 @@ Spotify 的 `PUT /me/player/play` 可以送出一串歌曲 URI。但這串歌播
 - `GET /albums?ids=` 已移除，所以發行日期改從 `GET /artists/{id}/albums` 的回應取得。
 - album 的 `album_group` 欄位已移除，所以「自己的作品」（`album,single`）和「客串」（`appears_on`）分兩次查。
 - 搜尋一次最多 10 筆。
+- 播放清單的內容改用 `GET /playlists/{id}/items`，而且**只能讀取自己建立或協作的清單**。追蹤別人的清單只拿得到名稱，所以這些清單在側邊欄會變淡，也不會算進打勾。
+- 「是否已按讚」改用 `GET /me/library/contains`，一次最多 40 首。藝人頁會分批查詢這位藝人的歌。
 
 ## 已知限制
 

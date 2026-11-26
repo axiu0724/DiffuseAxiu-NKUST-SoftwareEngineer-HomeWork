@@ -35,14 +35,20 @@ public struct DiscographyEntry: Sendable, Hashable, Identifiable {
     public let track: Track
     public let album: Album
     public let kind: ReleaseKind
+    /// 同一首歌在播放清單裡第幾次出現（從 0 開始）。藝人時間軸一律是 0。
+    public let occurrence: Int
 
-    public init(track: Track, album: Album, kind: ReleaseKind) {
+    public init(track: Track, album: Album, kind: ReleaseKind, occurrence: Int = 0) {
         self.track = track
         self.album = album
         self.kind = kind
+        self.occurrence = occurrence
     }
 
-    public var id: String { "\(album.id)/\(track.discNumber)/\(track.trackNumber)/\(track.uri)" }
+    public var id: String {
+        let base = "\(album.id)/\(track.discNumber)/\(track.trackNumber)/\(track.uri)"
+        return occurrence == 0 ? base : "\(base)#\(occurrence)"
+    }
     public var release: ReleaseDate { album.release }
 }
 

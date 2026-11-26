@@ -190,3 +190,33 @@ extension SpotifyClient: CatalogAPI {
         try await allPages(url("albums/\(albumID)/tracks", ["market": "from_token"]), of: Track.self)
     }
 }
+
+extension SpotifyClient: LibraryAPI {
+    public func currentUserID() async throws -> String {
+        let user: CurrentUser = try await get(url("me"))
+        return user.id
+    }
+
+    public func myPlaylists() async throws -> [Playlist] {
+        try await allPages(url("me/playlists", ["limit": "50"]), of: Playlist.self)
+    }
+
+    /// 2026 年 2 月起的新路徑（舊的 `/tracks` 已移除）。
+    public func playlistItems(playlistID: String) async throws -> [LibraryItem] {
+        try await allPages(
+            url("playlists/\(playlistID)/items", ["limit": "50", "market": "from_token", "additional_types": "track"]),
+            of: LibraryItem.self
+        )
+    }
+
+    public func likedItems() async throws -> [LibraryItem] {
+        try await allPages(url("me/tracks", ["limit": "50", "market": "from_token"]), of: LibraryItem.self)
+    }
+
+    /// 取代已移除的 `GET /me/tracks/contains`。
+    public func libraryContains(uris: [String]) async throws -> [Bool] {
+        guard !uris.isEmpty else { return [] }
+        precondition(uris.count <= LibraryLoader.containsBatchSize)
+        return try await get(url("me/library/contains", ["uris": uris.joined(separator: ",")]))
+    }
+}

@@ -4,6 +4,8 @@ public struct SpotifyAPIError: LocalizedError, Sendable {
     public let status: Int
     public let message: String
     public let reason: String?
+    /// 429 時 Spotify 要求等待的時間
+    public var retryAfter: Duration? = nil
 
     public var errorDescription: String? {
         let lower = message.lowercased()
@@ -17,21 +19,72 @@ public struct SpotifyAPIError: LocalizedError, Sendable {
             return "這個 Spotify 帳號不在開發者 app 的使用者名單中，請到 Spotify Dashboard 的 User Management 加入。"
         }
         if status == 429 {
-            return "請求太頻繁，Spotify 暫時拒絕。請稍後再試。"
+            guard let seconds = retryAfter?.components.seconds, seconds > 60 else {
+                return "請求太頻繁，Spotify 暫時拒絕。請稍後再試。"
+            }
+            let minutes = (seconds + 59) / 60
+            let wait = minutes < 120 ? "\(minutes) 分鐘" : "\((minutes + 59) / 60) 小時"
+            return "請求太頻繁，Spotify 暫時拒絕。大約 \(wait)後再試。"
         }
         return "Spotify 回應錯誤（HTTP \(status)）：\(message)"
     }
 }
 
+/// 所有請求共用的閘門：限制同時進行的請求數，並在 Spotify 回 429 後讓所有請求一起等，不要各自去撞限流。
+/// Spotify 是用 30 秒的滾動視窗計算請求數，請求越集中越容易超過上限，所以不管呼叫端有幾層並行，總數都由這裡控制。
+actor RequestGate {
+    private let limit: Int
+    private var running = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var blockedUntil: ContinuousClock.Instant?
+
+    init(limit: Int) { self.limit = limit }
+
+    func acquire() async {
+        if running < limit {
+            running += 1
+            return
+        }
+        // 名額由 release 直接轉交，running 不變
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            running -= 1
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+
+    func block(for duration: Duration) {
+        let until = ContinuousClock.now + duration
+        if blockedUntil.map({ until > $0 }) ?? true { blockedUntil = until }
+    }
+
+    /// 還要等多久才能再送請求；沒有被限流時回傳 nil。
+    func remainingBlock() -> Duration? {
+        guard let blockedUntil else { return nil }
+        let remaining = blockedUntil - .now
+        return remaining > .zero ? remaining : nil
+    }
+}
+
 /// Spotify Web API 的精簡 client。
 /// - 401：自動 refresh token 後重試一次。
-/// - 429：依 Retry-After 等待後重試（最多 3 次）。
+/// - 429：所有請求一起依 Retry-After 等待後重試（最多 3 次）；要等超過 30 秒就直接報錯，告訴使用者要等多久。
+/// - 同時進行的請求最多 4 個。
 /// - 有分頁的 endpoint 會沿著 `next` 抓完全部。
 public final class SpotifyClient: Sendable {
     public static let baseURL = URL(string: "https://api.spotify.com/v1/")!
+    /// 同時進行的請求上限（所有呼叫端加起來）
+    static let maxConcurrentRequests = 4
+    /// 被限流時最多願意等多久；超過就直接報錯
+    static let maxRateLimitWait: Duration = .seconds(30)
 
     private let tokens: TokenManager
     private let session: URLSession
+    private let gate = RequestGate(limit: maxConcurrentRequests)
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -58,6 +111,7 @@ public final class SpotifyClient: Sendable {
         var rateLimitRetries = 0
 
         while true {
+            try await waitForRateLimit()
             let token = didRefresh ? try await tokens.forceRefresh() : try await tokens.validAccessToken()
             var request = URLRequest(url: url)
             request.httpMethod = method
@@ -69,7 +123,16 @@ public final class SpotifyClient: Sendable {
                 request.setValue("0", forHTTPHeaderField: "Content-Length")
             }
 
-            let (data, response) = try await session.data(for: request)
+            await gate.acquire()
+            let data: Data, response: URLResponse
+            do {
+                try Task.checkCancellation()
+                (data, response) = try await session.data(for: request)
+            } catch {
+                await gate.release()
+                throw error
+            }
+            await gate.release()
             guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
 
             switch http.statusCode {
@@ -78,15 +141,29 @@ public final class SpotifyClient: Sendable {
             case 401 where !didRefresh:
                 didRefresh = true
                 continue
-            case 429 where rateLimitRetries < 3:
+            case 429:
+                let retryAfter = Duration.seconds(Double(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 2)
+                await gate.block(for: retryAfter)
+                guard rateLimitRetries < 3, retryAfter <= Self.maxRateLimitWait else {
+                    var error = Self.apiError(status: 429, data: data)
+                    error.retryAfter = retryAfter
+                    throw error
+                }
                 rateLimitRetries += 1
-                let wait = Double(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 2
-                try await Task.sleep(for: .seconds(min(wait, 30)))
-                continue
+                continue  // 下一輪開頭會等到限流解除
             default:
                 throw Self.apiError(status: http.statusCode, data: data)
             }
         }
+    }
+
+    /// 被限流時先等到解除再送；要等太久就不送了，直接報錯。
+    private func waitForRateLimit() async throws {
+        guard let remaining = await gate.remainingBlock() else { return }
+        guard remaining <= Self.maxRateLimitWait else {
+            throw SpotifyAPIError(status: 429, message: "Too many requests", reason: nil, retryAfter: remaining)
+        }
+        try await Task.sleep(for: remaining)
     }
 
     static func apiError(status: Int, data: Data) -> SpotifyAPIError {

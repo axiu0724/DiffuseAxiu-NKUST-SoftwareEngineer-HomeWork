@@ -26,11 +26,21 @@ public final class PlaybackController {
     public private(set) var stateFetchedAt: Date?
     public var deviceID: String?
     public var lastError: String?
+    /// app 是否在前景。不在前景、也沒有在連續播放時，輪詢會放慢。回到前景時立刻查一次。
+    public var isAppActive = true {
+        didSet { if isAppActive, !oldValue { pollSleepTask?.cancel() } }
+    }
 
     private let api: any PlayerAPI
     /// lastError 是不是輪詢造成的（例如暫時斷線）。是的話，下次輪詢成功就自動清掉。
     private var errorIsFromPolling = false
     private var pollTask: Task<Void, Never>?
+    /// 兩次輪詢之間的等待。取消它只會提早結束等待，不會中斷進行中的請求。
+    private var pollSleepTask: Task<Void, Never>?
+    /// 輪詢正在等待時，預計下次查詢的時間
+    @ObservationIgnored private(set) var nextPollAt: ContinuousClock.Instant?
+    /// 別處剛查過狀態、需要更密的輪詢時，輪詢被叫醒後改用這個間隔等待，不重複查詢
+    @ObservationIgnored private var rescheduledDelay: Duration?
 
     public init(api: any PlayerAPI) {
         self.api = api
@@ -95,10 +105,16 @@ public final class PlaybackController {
     public func startPolling() {
         guard pollTask == nil else { return }
         pollTask = Task { [weak self] in
+            guard var delay = await self?.refresh() else { return }
             while !Task.isCancelled {
                 guard let self else { return }
-                let delay = await self.refresh()
-                try? await Task.sleep(for: delay)
+                await self.sleepUntilNextPoll(delay)
+                guard !Task.isCancelled else { return }
+                if let rescheduled = self.takeRescheduledDelay() {
+                    delay = rescheduled
+                } else {
+                    delay = await self.refresh()
+                }
             }
         }
     }
@@ -106,6 +122,20 @@ public final class PlaybackController {
     public func stopPolling() {
         pollTask?.cancel()
         pollTask = nil
+        pollSleepTask?.cancel()
+    }
+
+    private func sleepUntilNextPoll(_ delay: Duration) async {
+        nextPollAt = .now + delay
+        let sleep = Task { _ = try? await Task.sleep(for: delay) }
+        pollSleepTask = sleep
+        await sleep.value
+        nextPollAt = nil
+    }
+
+    private func takeRescheduledDelay() -> Duration? {
+        defer { rescheduledDelay = nil }
+        return rescheduledDelay
     }
 
     /// 取得一次播放狀態並推進計畫。回傳建議的下次輪詢間隔。
@@ -134,7 +164,14 @@ public final class PlaybackController {
             self.plan = plan
             await perform(actions)
         }
-        return nextPollDelay()
+        let delay = nextPollDelay()
+        // 開始連續播放、按播放鍵這類手動查詢，可能讓間隔變短（例如背景閒置的 30 秒 → 3 秒）。
+        // 輪詢還在等較久的時間的話，叫醒它改用新的間隔；這次已經查過，它不會再多查一次。
+        if let nextPollAt, nextPollAt > .now + delay {
+            rescheduledDelay = delay
+            pollSleepTask?.cancel()
+        }
+        return delay
     }
 
     private func refreshSoon() async {
@@ -142,9 +179,17 @@ public final class PlaybackController {
         await refresh()
     }
 
-    /// 平常每 3 秒輪詢一次；歌快結束時提早一點查，讓補佇列和「播完暫停」更準時。
+    /// 播放中每 3 秒輪詢一次；歌快結束時提早一點查，讓補佇列和「播完暫停」更準時。
+    /// 連續播放中（或剛送出 play、還在等 Spotify 開始播）不管前景背景都維持這個頻率；
+    /// 其他情況在背景放慢到 30 秒，前景暫停或沒在播時 10 秒。
     private func nextPollDelay() -> Duration {
-        guard let state, state.isPlaying else { return .seconds(plan == nil ? 5 : 3) }
+        let isPlaying = state?.isPlaying == true
+        let needsPrecision = plan?.status == .playing && (isPlaying || plan?.hasConfirmedStart == false)
+        if !needsPrecision {
+            if !isAppActive { return .seconds(30) }
+            if !isPlaying { return .seconds(10) }
+        }
+        guard let state, isPlaying else { return .seconds(3) }
         if let duration = state.item?.durationMs, let progress = state.progressMs {
             let remaining = Double(duration - progress) / 1000
             if remaining < 3.5 { return .seconds(max(remaining + 0.4, 0.5)) }

@@ -6,11 +6,13 @@ struct ArtistDetailView: View {
     @ViewState private var selection: Set<DiscographyEntry.ID> = []
 
     var body: some View {
-        let entries = model.visibleTimeline
+        // 過濾、分段都在 AppModel 算好了，這裡不再每次重算。
+        let display = model.timelineDisplay
+        let entries = display.entries
         let currentID = model.player.currentEntry?.id
 
         VStack(spacing: 0) {
-            ArtistHeader(entries: entries)
+            ArtistHeader(entries: entries, albumCount: display.albumCount)
             Divider()
             if let progress = model.loadingProgress {
                 LoadingView(done: progress.done, total: progress.total)
@@ -19,7 +21,7 @@ struct ArtistDetailView: View {
             } else {
                 TrackColumnsHeader()
                 List(selection: $selection) {
-                    ForEach(Self.groupByYear(entries), id: \.year) { group in
+                    ForEach(display.groups, id: \.year) { group in
                         Section(group.year) {
                             ForEach(group.rows, id: \.entry.id) { row in
                                 TrackRow(
@@ -38,37 +40,14 @@ struct ArtistDetailView: View {
         }
         .navigationTitle(model.selectedArtist?.name ?? "")
     }
-
-    struct YearGroup {
-        let year: String
-        let rows: [(index: Int, entry: DiscographyEntry)]
-    }
-
-    static func groupByYear(_ entries: [DiscographyEntry]) -> [YearGroup] {
-        var groups: [YearGroup] = []
-        var rows: [(index: Int, entry: DiscographyEntry)] = []
-        var year: String?
-        for (index, entry) in entries.enumerated() {
-            let y = entry.release.yearText
-            if y != year, let year {
-                groups.append(YearGroup(year: year, rows: rows))
-                rows = []
-            }
-            year = y
-            rows.append((index, entry))
-        }
-        if let year { groups.append(YearGroup(year: year, rows: rows)) }
-        return groups
-    }
 }
 
 private struct ArtistHeader: View {
     @Environment(AppModel.self) private var model
     let entries: [DiscographyEntry]
+    let albumCount: Int
 
     var body: some View {
-        let albumCount = Set(entries.map(\.album.id)).count
-
         HStack(alignment: .center, spacing: 20) {
             ArtworkView(images: model.selectedArtist?.images, size: 112, shape: .circle)
                 .shadow(color: .black.opacity(0.2), radius: 12, y: 6)

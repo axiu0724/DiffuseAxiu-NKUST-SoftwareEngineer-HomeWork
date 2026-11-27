@@ -11,6 +11,37 @@ enum SidebarItem: Hashable {
     case playlist(Playlist.ID)
 }
 
+/// 藝人頁顯示用的資料：過濾後的時間軸、依年份分段、發行數。建立一次，重繪時直接用。
+struct TimelineDisplay {
+    struct YearGroup {
+        let year: String
+        let rows: [(index: Int, entry: DiscographyEntry)]
+    }
+
+    private(set) var entries: [DiscographyEntry] = []
+    private(set) var groups: [YearGroup] = []
+    private(set) var albumCount = 0
+
+    init() {}
+
+    init(_ entries: [DiscographyEntry]) {
+        self.entries = entries
+        albumCount = Set(entries.map(\.album.id)).count
+        var rows: [(index: Int, entry: DiscographyEntry)] = []
+        var year: String?
+        for (index, entry) in entries.enumerated() {
+            let y = entry.release.yearText
+            if y != year, let year {
+                groups.append(YearGroup(year: year, rows: rows))
+                rows = []
+            }
+            year = y
+            rows.append((index, entry))
+        }
+        if let year { groups.append(YearGroup(year: year, rows: rows)) }
+    }
+}
+
 /// 整個 app 的狀態：登入、搜尋、藝人作品時間軸、播放清單、裝置，以及連續播放控制器。
 @MainActor
 @Observable
@@ -52,17 +83,33 @@ final class AppModel {
         isSearching || searchText.trimmingCharacters(in: .whitespaces) != lastSearchedQuery
     }
     var selection: SidebarItem? {
-        didSet { if selection != oldValue { Task { await selectionChanged() } } }
+        didSet {
+            guard selection != oldValue else { return }
+            // 取消上一個選項還沒做完的工作，避免和新選項搶 Spotify 的請求額度。
+            selectionTask?.cancel()
+            selectionTask = Task { await selectionChanged() }
+        }
     }
+    @ObservationIgnored private var selectionTask: Task<Void, Never>?
     var selectedArtistID: Artist.ID? {
         if case .artist(let id) = selection { id } else { nil }
     }
     private(set) var selectedArtist: Artist?
     /// 目前藝人的完整時間軸（所有類型），用 enabledKinds 在本機過濾
-    private(set) var timeline: [DiscographyEntry] = []
-    var enabledKinds: Set<ReleaseKind> = Set(ReleaseKind.allCases)
+    private(set) var timeline: [DiscographyEntry] = [] {
+        didSet { timelineDisplay = TimelineDisplay(timeline.filter { enabledKinds.contains($0.kind) }) }
+    }
+    var enabledKinds: Set<ReleaseKind> = Set(ReleaseKind.allCases) {
+        didSet { timelineDisplay = TimelineDisplay(timeline.filter { enabledKinds.contains($0.kind) }) }
+    }
+    /// 藝人頁顯示用的資料。只在 timeline 或 enabledKinds 改變時重算，不在每次重繪時算。
+    private(set) var timelineDisplay = TimelineDisplay()
     private(set) var loadingProgress: (done: Int, total: Int)?
+    /// 最近看過的藝人時間軸，最多留 `timelineCacheLimit` 位
     private var timelineCache: [Artist.ID: [DiscographyEntry]] = [:]
+    /// 時間軸快取的使用順序，最近用過的在最後
+    @ObservationIgnored private var timelineCacheOrder: [Artist.ID] = []
+    private static let timelineCacheLimit = 10
     private var loadTask: Task<Void, Never>?
 
     // MARK: 播放清單與已按讚的歌曲
@@ -70,9 +117,20 @@ final class AppModel {
     /// 歌曲存在哪些清單
     private(set) var library = LibraryIndex()
     /// 每個可讀清單的內容（依清單原本的順序）
-    private(set) var playlistEntries: [Playlist.ID: [DiscographyEntry]] = [:]
+    private(set) var playlistEntries: [Playlist.ID: [DiscographyEntry]] = [:] {
+        didSet { playlistDurationsMs = playlistEntries.mapValues(Self.totalDurationMs) }
+    }
     /// 已按讚的歌曲（第一次打開時才讀取，可能有上千首）
-    private(set) var likedEntries: [DiscographyEntry]?
+    private(set) var likedEntries: [DiscographyEntry]? = nil {
+        didSet { likedDurationMs = likedEntries.map(Self.totalDurationMs) ?? 0 }
+    }
+    /// 清單的總時長（毫秒），清單內容改變時才重算
+    private var playlistDurationsMs: [Playlist.ID: Int] = [:]
+    private var likedDurationMs = 0
+    /// 上次讀到的清單內容，重新整理時 snapshot_id 沒變的清單直接沿用
+    @ObservationIgnored private var lastPlaylistContents: LibraryLoader.PlaylistContents?
+    /// 正在查詢已按讚狀態的 URI，避免同一批歌重複送出
+    @ObservationIgnored private var likedQueriesInFlight: Set<String> = []
     private(set) var isLoadingLiked = false
     /// 讀取清單中的進度；nil 代表沒有在讀取
     private(set) var libraryProgress: (done: Int, total: Int)?
@@ -87,11 +145,17 @@ final class AppModel {
     var errorMessage: String?
 
     init() {
+        // 封面用 AsyncImage 載入，它沒有自己的圖片快取，只靠 URLCache.shared，預設容量很小。
+        // 要在第一次用到 URLSession.shared（建立 SpotifyClient）之前設定。
+        URLCache.shared = URLCache(memoryCapacity: 50 * 1024 * 1024, diskCapacity: 200 * 1024 * 1024)
+
         let defaults = UserDefaults.standard
         let savedClientID = defaults.string(forKey: Keys.clientID) ?? ""
         let savedWindow = defaults.integer(forKey: Keys.windowSize)
         let store = KeychainTokenStore()
-        let tokens = TokenManager(clientID: savedClientID, store: store)
+        // Keychain 只讀一次，結果直接交給 TokenManager。
+        let savedTokens = store.load()
+        let tokens = TokenManager(clientID: savedClientID, store: store, savedTokens: savedTokens)
         let client = SpotifyClient(tokens: tokens)
 
         self.clientID = savedClientID
@@ -101,13 +165,35 @@ final class AppModel {
         self.client = client
         self.player = PlaybackController(api: client)
 
-        if !savedClientID.isEmpty, store.load() != nil {
+        observeAppActivation()
+        if !savedClientID.isEmpty, savedTokens != nil {
             didLogin()
         }
     }
 
-    var visibleTimeline: [DiscographyEntry] {
-        timeline.filter { enabledKinds.contains($0.kind) }
+    /// 讓播放器知道 app 是否在前景，決定輪詢的頻率。
+    private func observeAppActivation() {
+        let center = NotificationCenter.default
+        for (name, isActive) in [(NSApplication.didBecomeActiveNotification, true), (NSApplication.didResignActiveNotification, false)] {
+            _ = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.player.isAppActive = isActive }
+            }
+        }
+    }
+
+    var visibleTimeline: [DiscographyEntry] { timelineDisplay.entries }
+
+    /// 清單的總時長（毫秒）
+    func totalDurationMs(of item: SidebarItem) -> Int {
+        switch item {
+        case .likedSongs: likedDurationMs
+        case .playlist(let id): playlistDurationsMs[id] ?? 0
+        case .artist: 0
+        }
+    }
+
+    private static func totalDurationMs(_ entries: [DiscographyEntry]) -> Int {
+        entries.reduce(0) { $0 + $1.track.durationMs }
     }
 
     /// 目前畫面上的歌曲清單，也是按下播放時要連續播放的那一份
@@ -121,7 +207,7 @@ final class AppModel {
     }
 
     func playlist(id: Playlist.ID) -> Playlist? {
-        library.playlists.first { $0.id == id }
+        library.playlist(id: id)
     }
 
     func locations(of entry: DiscographyEntry) -> [SavedLocation] {
@@ -139,9 +225,11 @@ final class AppModel {
         logout()
         clientID = trimmed
         UserDefaults.standard.set(trimmed, forKey: Keys.clientID)
-        tokens = TokenManager(clientID: trimmed, store: tokenStore)
+        // 剛登出，Keychain 裡已經沒有 token，不用再讀一次。
+        tokens = TokenManager(clientID: trimmed, store: tokenStore, savedTokens: nil)
         client = SpotifyClient(tokens: tokens)
         player = PlaybackController(api: client)
+        player.isAppActive = NSApplication.shared.isActive
     }
 
     func login(using session: WebAuthenticationSession) async {
@@ -172,6 +260,7 @@ final class AppModel {
         }
     }
 
+    /// 登入後只在這裡讀一次裝置清單（DeviceMenu 不再自己讀）。
     private func didLogin() {
         isLoggedIn = true
         player.startPolling()
@@ -182,18 +271,20 @@ final class AppModel {
     func logout() {
         player.stopPolling()
         player.stopSequence()
+        // TokenManager 會清掉 Keychain（並確保進行中的 refresh 不會寫回），這裡不再重複清一次。
         Task { [tokens] in await tokens.logout() }
-        tokenStore.clear()
         isLoggedIn = false
         searchResults = []
         selection = nil
         selectedArtist = nil
         timeline = []
         timelineCache = [:]
+        timelineCacheOrder = []
         devices = []
         libraryTask?.cancel()
         likedTask?.cancel()
         library = LibraryIndex()
+        lastPlaylistContents = nil
         playlistEntries = [:]
         likedEntries = nil
         isLoadingLiked = false
@@ -229,8 +320,11 @@ final class AppModel {
         case .artist, nil:
             await loadSelectedArtist()
         case .likedSongs:
+            // 離開還在讀取的藝人：停掉它剩下的上百個曲目請求，不和這個清單搶額度。
+            loadTask?.cancel()
             await loadLikedIfNeeded()
         case .playlist(let id):
+            loadTask?.cancel()
             await checkLiked(playlistEntries[id] ?? [])
         }
     }
@@ -246,6 +340,7 @@ final class AppModel {
         }
         selectedArtist = searchResults.first { $0.id == id } ?? selectedArtist
         if let cached = timelineCache[id] {
+            touchTimelineCache(id)
             timeline = cached
             loadingProgress = nil
             await checkLiked(cached)
@@ -269,6 +364,7 @@ final class AppModel {
                 )
                 try Task.checkCancellation()
                 timelineCache[id] = entries
+                touchTimelineCache(id)
                 if selectedArtistID == id {
                     timeline = entries
                     loadingProgress = nil
@@ -276,12 +372,23 @@ final class AppModel {
                 }
             } catch is CancellationError {
             } catch {
+                // 被取消（換了藝人或重新讀取）時，進度由新的讀取負責，不要清掉。
+                guard !Self.isCancellation(error) else { return }
                 if selectedArtistID == id { loadingProgress = nil }
                 report(error)
             }
         }
         loadTask = task
         await task.value
+    }
+
+    /// 把藝人標成最近用過，超過上限時丟掉最久沒看的。
+    private func touchTimelineCache(_ id: Artist.ID) {
+        timelineCacheOrder.removeAll { $0 == id }
+        timelineCacheOrder.append(id)
+        while timelineCacheOrder.count > Self.timelineCacheLimit {
+            timelineCache[timelineCacheOrder.removeFirst()] = nil
+        }
     }
 
     func reloadSelectedArtist() async {
@@ -305,16 +412,18 @@ final class AppModel {
         isLoadingLiked = false
         libraryProgress = (0, 0)
 
-        let task = Task { [client] in
+        let task = Task { [client, previous = lastPlaylistContents] in
             do {
-                let contents = try await LibraryLoader.loadPlaylists(api: client, progress: { done, total in
+                let contents = try await LibraryLoader.loadPlaylists(api: client, previous: previous, progress: { done, total in
                     Task { @MainActor in
                         if self.libraryProgress != nil { self.libraryProgress = (done, total) }
                     }
                 })
                 try Task.checkCancellation()
-                library.setPlaylists(contents.playlists, unreadable: contents.unreadable, contents: contents.uris)
-                playlistEntries = contents.items.mapValues(PlaylistEntries.make)
+                // 轉換和索引都在 LibraryLoader 裡（不在主執行緒）做好了，這裡只指派結果。
+                library.setPlaylists(from: contents.index)
+                playlistEntries = contents.entries
+                lastPlaylistContents = contents
                 libraryProgress = nil
             } catch is CancellationError {
             } catch {
@@ -342,10 +451,11 @@ final class AppModel {
         isLoadingLiked = true
         let task = Task { [client] in
             do {
-                let items = try await client.likedItems()
+                // 轉換在 LibraryLoader 裡（不在主執行緒）做好，這裡只指派結果。
+                let liked = try await LibraryLoader.loadLiked(api: client)
                 try Task.checkCancellation()
-                likedEntries = PlaylistEntries.make(items)
-                library.replaceLiked(with: Set(items.compactMap { $0.track?.track.uri }))
+                likedEntries = liked.entries
+                library.replaceLiked(with: liked.uris)
             } catch is CancellationError {
             } catch {
                 report(error)
@@ -359,8 +469,11 @@ final class AppModel {
     /// 查詢還不知道是否已按讚的歌曲。
     private func checkLiked(_ entries: [DiscographyEntry]) async {
         guard isLoggedIn, !needsLibraryAuthorization else { return }
-        let unknown = entries.map(\.track.uri).filter { !library.isLikedKnown($0) }
+        // 已經在查的 URI 不重複送（例如快速切回同一個清單）。
+        let unknown = entries.map(\.track.uri).filter { !library.isLikedKnown($0) && !likedQueriesInFlight.contains($0) }
         guard !unknown.isEmpty else { return }
+        likedQueriesInFlight.formUnion(unknown)
+        defer { likedQueriesInFlight.subtract(unknown) }
         do {
             let status = try await LibraryLoader.likedStatus(of: unknown, api: client)
             library.setLiked(status)
@@ -415,7 +528,14 @@ final class AppModel {
 
     // MARK: - 錯誤
 
+    /// 工作被取消時，URLSession 丟的是 URLError(.cancelled)，不是 CancellationError。
+    private static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
+
     private func report(_ error: any Error) {
+        // 切換選項時取消的請求不是錯誤，不顯示。
+        guard !Self.isCancellation(error) else { return }
         if case SpotifyAuthError.notLoggedIn = error {
             isLoggedIn = false
             player.stopPolling()

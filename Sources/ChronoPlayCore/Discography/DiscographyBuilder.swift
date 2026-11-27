@@ -24,19 +24,21 @@ public enum DiscographyBuilder {
         var albums: [(Album, ReleaseKind)] = []
         var seen = Set<String>()
 
-        if !kinds.isDisjoint(with: [.album, .single]) {
-            for album in try await api.artistAlbums(artistID: artistID, groups: "album,single") {
-                let kind: ReleaseKind = album.albumType == "single" ? .single : .album
-                if kinds.contains(kind), seen.insert(album.id).inserted {
-                    albums.append((album, kind))
-                }
+        // 兩份清單互不相依，同時抓；合併時仍先放自己的作品，去重時自己的作品優先。
+        async let ownAlbums: [Album] = kinds.isDisjoint(with: [.album, .single])
+            ? [] : api.artistAlbums(artistID: artistID, groups: "album,single")
+        async let guestAlbums: [Album] = kinds.contains(.appearsOn)
+            ? api.artistAlbums(artistID: artistID, groups: "appears_on") : []
+
+        for album in try await ownAlbums {
+            let kind: ReleaseKind = album.albumType == "single" ? .single : .album
+            if kinds.contains(kind), seen.insert(album.id).inserted {
+                albums.append((album, kind))
             }
         }
-        if kinds.contains(.appearsOn) {
-            for album in try await api.artistAlbums(artistID: artistID, groups: "appears_on") {
-                if seen.insert(album.id).inserted {
-                    albums.append((album, .appearsOn))
-                }
+        for album in try await guestAlbums {
+            if seen.insert(album.id).inserted {
+                albums.append((album, .appearsOn))
             }
         }
 

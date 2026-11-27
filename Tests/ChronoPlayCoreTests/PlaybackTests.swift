@@ -150,6 +150,43 @@ struct PlaybackControllerTests {
         #expect(controller.plan == nil)
         #expect(controller.lastError == "遙控播放需要 Spotify Premium。")
     }
+
+    @Test("沒在連續播放時，暫停與背景會放慢輪詢；連續播放中在背景也維持原本頻率")
+    func pollingSlowsDownWhenIdle() async {
+        let player = FakePlayer()
+        let controller = PlaybackController(api: player)
+
+        await player.setCurrent(uri: "other", isPlaying: false)
+        #expect(await controller.refresh() == .seconds(10))
+        controller.isAppActive = false
+        #expect(await controller.refresh() == .seconds(30))
+
+        await controller.start(entries: entries(3), at: 0, windowSize: 3)
+        #expect(await controller.refresh() == .seconds(3))
+    }
+
+    @Test("背景閒置時開始連續播放，輪詢不用等滿 30 秒，直接改用連續播放的間隔")
+    func startReschedulesSlowPolling() async throws {
+        let player = FakePlayer()
+        await player.setCurrent(uri: "other", isPlaying: false)
+        let controller = PlaybackController(api: player)
+        controller.isAppActive = false
+        controller.startPolling()
+        defer { controller.stopPolling() }
+
+        func waitForPoll(before limit: Duration) async throws -> Bool {
+            for _ in 0..<200 {
+                if let next = controller.nextPollAt, next < .now + limit { return true }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            return false
+        }
+        #expect(try await waitForPoll(before: .seconds(31)))
+        #expect(controller.nextPollAt.map { $0 > .now + .seconds(20) } == true)
+
+        await controller.start(entries: entries(3), at: 0, windowSize: 3)
+        #expect(try await waitForPoll(before: .seconds(4)))
+    }
 }
 
 @Suite("PKCE")

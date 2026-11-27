@@ -23,18 +23,22 @@ public struct Playlist: Decodable, Sendable, Hashable, Identifiable {
     public let images: [SpotifyImage]?
     public let owner: PlaylistOwner
     public let collaborative: Bool?
+    /// 清單內容每次改變都會換一個新值；相同就代表內容沒變，可以沿用上次讀到的歌曲。
+    public let snapshotID: String?
     private let itemCount: ItemCount?
     private let legacyTrackCount: ItemCount?
 
     private enum CodingKeys: String, CodingKey {
         case id, name, uri, images, owner, collaborative
+        // convertFromSnakeCase 會先把 snapshot_id 轉成 snapshotId
+        case snapshotID = "snapshotId"
         case itemCount = "items"
         case legacyTrackCount = "tracks"
     }
 
     public init(
         id: String, name: String, owner: PlaylistOwner, collaborative: Bool = false,
-        trackCount: Int? = nil, images: [SpotifyImage]? = nil
+        trackCount: Int? = nil, images: [SpotifyImage]? = nil, snapshotID: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -42,6 +46,7 @@ public struct Playlist: Decodable, Sendable, Hashable, Identifiable {
         self.images = images
         self.owner = owner
         self.collaborative = collaborative
+        self.snapshotID = snapshotID
         self.itemCount = ItemCount(total: trackCount)
         self.legacyTrackCount = nil
     }

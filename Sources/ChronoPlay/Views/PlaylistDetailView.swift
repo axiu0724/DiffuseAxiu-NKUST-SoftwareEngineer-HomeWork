@@ -32,7 +32,8 @@ struct PlaylistDetailView: View {
             } else {
                 TrackColumnsHeader()
                 List(selection: $selection) {
-                    ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                    // enumerated() 本身就是 RandomAccessCollection，不用每次重繪都複製成 Array。
+                    ForEach(entries.enumerated(), id: \.element.id) { index, entry in
                         TrackRow(
                             index: index, entry: entry,
                             isCurrent: entry.id == currentID,
@@ -133,7 +134,7 @@ private struct PlaylistHeader: View {
             if playlist.collaborative == true { parts.append("協作清單") }
         }
         if !entries.isEmpty {
-            let minutes = entries.reduce(0) { $0 + $1.track.durationMs } / 60_000
+            let minutes = model.totalDurationMs(of: item) / 60_000
             parts.append("共 \(entries.count) 首")
             parts.append(minutes >= 60 ? "\(minutes / 60) 小時 \(minutes % 60) 分鐘" : "\(minutes) 分鐘")
         }

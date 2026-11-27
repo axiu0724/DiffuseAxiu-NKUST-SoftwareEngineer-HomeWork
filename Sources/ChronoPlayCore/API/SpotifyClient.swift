@@ -107,19 +107,65 @@ public final class SpotifyClient: Sendable {
         try decoder.decode(T.self, from: try await send("GET", url))
     }
 
+    /// 同一份分頁資料最多同時抓幾頁。
+    static let maxConcurrentPageRequests = 4
+
+    /// 抓完第一頁後，依 `total` 和 `next` 網址裡的 offset／limit 算出其餘分頁，用有限並行一起抓，再依順序接起來。
+    /// 拿不到這些資訊時，退回一頁一頁跟著 `next` 走。
     private func allPages<Item: Decodable & Sendable>(_ first: URL, of type: Item.Type) async throws -> [Item] {
-        var items: [Item] = []
-        var next: URL? = first
-        while let url = next {
-            let page = try await get(url, as: Paging<Item>.self)
-            items += page.items
-            // 只跟進 Spotify API 本身的網址，避免把 Bearer token 送到別的主機。
-            if let url = page.next, url.scheme != "https" || url.host() != Self.baseURL.host() {
-                throw URLError(.badServerResponse)
+        let firstPage = try await get(first, as: Paging<Item>.self)
+        guard let next = try Self.checkedNext(of: firstPage) else { return firstPage.items }
+
+        guard let total = firstPage.total,
+              var components = URLComponents(url: next, resolvingAgainstBaseURL: false),
+              let query = components.queryItems,
+              let offset = query.first(where: { $0.name == "offset" })?.value.flatMap({ Int($0) }),
+              let limit = query.first(where: { $0.name == "limit" })?.value.flatMap({ Int($0) }), limit > 0
+        else {
+            var items = firstPage.items
+            var url: URL? = next
+            while let current = url {
+                let page = try await get(current, as: Paging<Item>.self)
+                items += page.items
+                url = try Self.checkedNext(of: page)
             }
-            next = page.next
+            return items
         }
-        return items
+
+        // 只改 offset，主機和其他參數都沿用已檢查過的 next 網址。
+        var urls: [URL] = []
+        for pageOffset in stride(from: offset, to: total, by: limit) {
+            components.queryItems = query.map { $0.name == "offset" ? URLQueryItem(name: "offset", value: String(pageOffset)) : $0 }
+            guard let url = components.url else { throw URLError(.badURL) }
+            urls.append(url)
+        }
+
+        var pages = [[Item]](repeating: [], count: urls.count)
+        try await withThrowingTaskGroup(of: (Int, [Item]).self) { group in
+            var nextIndex = 0
+            func addTask() {
+                let index = nextIndex
+                let url = urls[index]
+                nextIndex += 1
+                group.addTask {
+                    let page = try await self.get(url, as: Paging<Item>.self)
+                    return (index, page.items)
+                }
+            }
+            for _ in 0..<min(Self.maxConcurrentPageRequests, urls.count) { addTask() }
+            while let (index, items) = try await group.next() {
+                pages[index] = items
+                if nextIndex < urls.count { addTask() }
+            }
+        }
+        return firstPage.items + pages.joined()
+    }
+
+    /// 只跟進 Spotify API 本身的網址，避免把 Bearer token 送到別的主機。
+    private static func checkedNext<Item: Decodable & Sendable>(of page: Paging<Item>) throws -> URL? {
+        guard let url = page.next else { return nil }
+        guard url.scheme == "https", url.host() == baseURL.host() else { throw URLError(.badServerResponse) }
+        return url
     }
 
     // MARK: - 目錄
@@ -187,7 +233,7 @@ extension SpotifyClient: CatalogAPI {
     }
 
     public func albumTracks(albumID: String) async throws -> [Track] {
-        try await allPages(url("albums/\(albumID)/tracks", ["market": "from_token"]), of: Track.self)
+        try await allPages(url("albums/\(albumID)/tracks", ["limit": "50", "market": "from_token"]), of: Track.self)
     }
 }
 

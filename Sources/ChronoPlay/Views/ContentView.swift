@@ -265,6 +265,5 @@ struct DeviceMenu: View {
                 .labelStyle(.titleAndIcon)
         }
         .help("選擇要播放的 Spotify Connect 裝置")
-        .task { await model.refreshDevices() }
     }
 }

@@ -129,6 +129,8 @@ actor FakeLibrary: LibraryAPI {
         self.liked = liked
     }
 
+    func setPlaylists(_ playlists: [Playlist]) { self.playlists = playlists }
+
     func currentUserID() async throws -> String { userID }
     func myPlaylists() async throws -> [Playlist] { playlists }
     func playlistItems(playlistID: String) async throws -> [LibraryItem] {
@@ -167,6 +169,27 @@ struct LibraryLoaderTests {
         #expect(contents.unreadable == ["collab", "followed"])
         #expect(contents.uris == ["own": ["spotify:track:t1"]])
         #expect(contents.playlists.map(\.id) == ["own", "collab", "followed"])
+    }
+
+    @Test("snapshot_id 沒變的清單沿用上次的內容，只重抓改過的清單")
+    func reusesUnchangedPlaylists() async throws {
+        let me = PlaylistOwner(id: "me")
+        let same = Playlist(id: "same", name: "沒變", owner: me, snapshotID: "s1")
+        let api = FakeLibrary(
+            playlists: [same, Playlist(id: "changed", name: "改過", owner: me, snapshotID: "c1")],
+            items: ["same": [item("t1")], "changed": [item("t2")]]
+        )
+        let first = try await LibraryLoader.loadPlaylists(api: api)
+
+        await api.setPlaylists([same, Playlist(id: "changed", name: "改過", owner: me, snapshotID: "c2")])
+        let second = try await LibraryLoader.loadPlaylists(api: api, previous: first)
+
+        let reads = await api.readPlaylists
+        #expect(reads.count == 3)
+        #expect(reads.last == "changed")
+        #expect(second.uris == first.uris)
+        #expect(second.entries["same"] == first.entries["same"])
+        #expect(second.index.locations(of: "spotify:track:t1") == [.playlist(same)])
     }
 
     @Test("已按讚狀態去除重複後，每 40 個一批查詢")

@@ -35,10 +35,10 @@ public enum PlaylistEntries {
         return items.compactMap { item in
             guard let full = item.track, full.track.isLocal != true, full.track.isPlayable != false else { return nil }
             let kind: ReleaseKind = full.album.albumType == "single" ? .single : .album
-            let base = DiscographyEntry(track: full.track, album: full.album, kind: kind)
-            let occurrence = counts[base.id, default: 0]
-            counts[base.id] = occurrence + 1
-            return DiscographyEntry(track: full.track, album: full.album, kind: kind, occurrence: occurrence)
+            let base = DiscographyEntry.baseID(track: full.track, album: full.album)
+            let occurrence = counts[base, default: 0]
+            counts[base] = occurrence + 1
+            return DiscographyEntry(track: full.track, album: full.album, kind: kind, occurrence: occurrence, baseID: base)
         }
     }
 }
@@ -53,6 +53,7 @@ public struct LibraryIndex: Sendable {
     public private(set) var unreadable: Set<Playlist.ID> = []
     /// 已讀取內容的清單：URI → 所在清單的 id（依清單順序）
     private var membership: [String: [Playlist.ID]] = [:]
+    private var playlistsByID: [Playlist.ID: Playlist] = [:]
     /// 已查過的「已按讚」狀態
     private var liked: [String: Bool] = [:]
 
@@ -61,6 +62,7 @@ public struct LibraryIndex: Sendable {
     public mutating func setPlaylists(_ playlists: [Playlist], unreadable: Set<Playlist.ID>, contents: [Playlist.ID: [String]]) {
         self.playlists = playlists
         self.unreadable = unreadable
+        playlistsByID = Dictionary(playlists.map { ($0.id, $0) }) { first, _ in first }
         membership = [:]
         for playlist in playlists {
             for uri in Set(contents[playlist.id] ?? []) {
@@ -68,6 +70,16 @@ public struct LibraryIndex: Sendable {
             }
         }
     }
+
+    /// 換成另一個索引（通常是在背景建好的）的清單資料，保留已查過的已按讚狀態。
+    public mutating func setPlaylists(from other: LibraryIndex) {
+        playlists = other.playlists
+        unreadable = other.unreadable
+        membership = other.membership
+        playlistsByID = other.playlistsByID
+    }
+
+    public func playlist(id: Playlist.ID) -> Playlist? { playlistsByID[id] }
 
     public mutating func setLiked(_ status: [String: Bool]) {
         liked.merge(status) { $1 }
@@ -84,8 +96,9 @@ public struct LibraryIndex: Sendable {
     /// 歌曲所在的位置：已按讚的歌曲排第一，其餘依清單順序。沒有收藏時回傳空陣列。
     public func locations(of uri: String) -> [SavedLocation] {
         var result: [SavedLocation] = liked[uri] == true ? [.liked] : []
-        let ids = Set(membership[uri] ?? [])
-        result += playlists.filter { ids.contains($0.id) }.map(SavedLocation.playlist)
+        // membership 本來就依清單順序排好，直接查字典，不用掃過所有清單。
+        guard let ids = membership[uri] else { return result }
+        result += ids.compactMap { playlistsByID[$0] }.map(SavedLocation.playlist)
         return result
     }
 }
@@ -94,21 +107,24 @@ public enum LibraryLoader {
     /// `GET /me/library/contains` 一次最多 40 個 URI。
     public static let containsBatchSize = 40
 
+    /// 讀完的清單資料。轉換都在讀取時（不在主執行緒）做好，呼叫端只要指派結果。
     public struct PlaylistContents: Sendable {
         public var playlists: [Playlist]
-        public var items: [Playlist.ID: [LibraryItem]]
         public var unreadable: Set<Playlist.ID>
-
-        /// 給 `LibraryIndex.setPlaylists` 用的 URI 清單
-        public var uris: [Playlist.ID: [String]] {
-            items.mapValues { $0.compactMap { $0.track?.track.uri } }
-        }
+        /// 每個可讀清單的歌曲 URI（包含不能播放的），給 `LibraryIndex.setPlaylists` 用
+        public var uris: [Playlist.ID: [String]]
+        /// 每個可讀清單轉好的曲目（依清單原本的順序）
+        public var entries: [Playlist.ID: [DiscographyEntry]]
+        /// 已經建好的清單索引（不含已按讚狀態），交給 `LibraryIndex.setPlaylists(from:)`
+        public var index: LibraryIndex
     }
 
     /// 抓出所有清單，並讀取每個可讀清單的內容。
     /// 讀不到的清單（不是自己的，或 Spotify 回 403）記在 `unreadable`，不會讓整個流程失敗。
+    /// 傳入上次的結果時，`snapshot_id` 沒變的清單直接沿用，不再重抓內容。
     public static func loadPlaylists(
         api: some LibraryAPI,
+        previous: PlaylistContents? = nil,
         maxConcurrentRequests: Int = 4,
         progress: (@Sendable (Int, Int) -> Void)? = nil
     ) async throws -> PlaylistContents {
@@ -117,11 +133,26 @@ public enum LibraryLoader {
         let me = try await userID
 
         var unreadable = Set(playlists.filter { !$0.isReadable(byUserID: me) }.map(\.id))
-        let readable = playlists.filter { !unreadable.contains($0.id) }
-        var items: [Playlist.ID: [LibraryItem]] = [:]
+        var uris: [Playlist.ID: [String]] = [:]
+        var entries: [Playlist.ID: [DiscographyEntry]] = [:]
+
+        var previousSnapshots: [Playlist.ID: String] = [:]
+        for playlist in previous?.playlists ?? [] {
+            if let snapshot = playlist.snapshotID { previousSnapshots[playlist.id] = snapshot }
+        }
+        var readable: [Playlist] = []
+        for playlist in playlists where !unreadable.contains(playlist.id) {
+            if let snapshot = playlist.snapshotID, previousSnapshots[playlist.id] == snapshot,
+               let cachedURIs = previous?.uris[playlist.id], let cachedEntries = previous?.entries[playlist.id] {
+                uris[playlist.id] = cachedURIs
+                entries[playlist.id] = cachedEntries
+            } else {
+                readable.append(playlist)
+            }
+        }
         progress?(0, readable.count)
 
-        try await withThrowingTaskGroup(of: (Playlist.ID, [LibraryItem]?).self) { group in
+        try await withThrowingTaskGroup(of: (Playlist.ID, ([String], [DiscographyEntry])?).self) { group in
             var next = 0
             var finished = 0
             func addTask() {
@@ -129,7 +160,9 @@ public enum LibraryLoader {
                 next += 1
                 group.addTask {
                     do {
-                        return (id, try await api.playlistItems(playlistID: id))
+                        // 轉換也在子工作裡做，多個清單可以同時處理。
+                        let items = try await api.playlistItems(playlistID: id)
+                        return (id, (items.compactMap { $0.track?.track.uri }, PlaylistEntries.make(items)))
                     } catch let error as SpotifyAPIError where error.status == 403 || error.status == 404 {
                         return (id, nil)
                     }
@@ -137,13 +170,27 @@ public enum LibraryLoader {
             }
             for _ in 0..<min(maxConcurrentRequests, readable.count) { addTask() }
             while let (id, result) = try await group.next() {
-                if let result { items[id] = result } else { unreadable.insert(id) }
+                if let (playlistURIs, playlistEntries) = result {
+                    uris[id] = playlistURIs
+                    entries[id] = playlistEntries
+                } else {
+                    unreadable.insert(id)
+                }
                 finished += 1
                 progress?(finished, readable.count)
                 if next < readable.count { addTask() }
             }
         }
-        return PlaylistContents(playlists: playlists, items: items, unreadable: unreadable)
+
+        var index = LibraryIndex()
+        index.setPlaylists(playlists, unreadable: unreadable, contents: uris)
+        return PlaylistContents(playlists: playlists, unreadable: unreadable, uris: uris, entries: entries, index: index)
+    }
+
+    /// 讀取已按讚的歌曲，並在這裡（不在主執行緒）轉成曲目與 URI 集合。
+    public static func loadLiked(api: some LibraryAPI) async throws -> (entries: [DiscographyEntry], uris: Set<String>) {
+        let items = try await api.likedItems()
+        return (PlaylistEntries.make(items), Set(items.compactMap { $0.track?.track.uri }))
     }
 
     /// 查一批歌曲是否已按讚。重複的 URI 只查一次，並分批送出。

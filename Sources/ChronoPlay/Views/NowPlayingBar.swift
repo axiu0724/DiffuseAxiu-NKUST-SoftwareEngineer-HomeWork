@@ -107,8 +107,8 @@ private struct PlaybackProgress: View {
 
     var body: some View {
         let player = model.player
-        // 兩次輪詢之間，用本機時間推算進度，讓進度條平順地前進
-        TimelineView(.periodic(from: .now, by: 1)) { context in
+        // 兩次輪詢之間，用本機時間推算進度，讓進度條平順地前進。沒在播放時進度不會動，就不排程更新。
+        TimelineView(.animation(minimumInterval: 1, paused: player.state?.isPlaying != true)) { context in
             let duration = Double(player.state?.item?.durationMs ?? 0) / 1000
             let elapsed = estimatedElapsed(at: context.date)
             HStack(spacing: 8) {

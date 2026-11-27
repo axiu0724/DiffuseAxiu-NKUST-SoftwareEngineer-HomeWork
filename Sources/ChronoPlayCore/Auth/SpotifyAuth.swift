@@ -86,10 +86,15 @@ public actor TokenManager {
     private var generation = 0
 
     public init(clientID: String, store: any TokenStore, session: URLSession = .shared) {
+        self.init(clientID: clientID, store: store, session: session, savedTokens: store.load())
+    }
+
+    /// 呼叫端已經讀過 store（或確定裡面是空的）時用這個，避免再讀一次 Keychain。
+    public init(clientID: String, store: any TokenStore, session: URLSession = .shared, savedTokens: Tokens?) {
         self.clientID = clientID
         self.store = store
         self.session = session
-        self.tokens = store.load()
+        self.tokens = savedTokens
     }
 
     public var isLoggedIn: Bool { tokens != nil }

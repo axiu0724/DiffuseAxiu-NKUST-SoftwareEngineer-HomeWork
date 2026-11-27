@@ -37,19 +37,28 @@ public struct DiscographyEntry: Sendable, Hashable, Identifiable {
     public let kind: ReleaseKind
     /// 同一首歌在播放清單裡第幾次出現（從 0 開始）。藝人時間軸一律是 0。
     public let occurrence: Int
+    /// 建立時就算好存起來：列表、排序與播放會反覆讀取，不要每次都重組字串、重新解析日期。
+    public let id: String
+    public let release: ReleaseDate
 
     public init(track: Track, album: Album, kind: ReleaseKind, occurrence: Int = 0) {
+        self.init(track: track, album: album, kind: kind, occurrence: occurrence, baseID: Self.baseID(track: track, album: album))
+    }
+
+    /// 已經算好 `baseID(track:album:)` 時用這個，避免再組一次字串。
+    init(track: Track, album: Album, kind: ReleaseKind, occurrence: Int, baseID: String) {
         self.track = track
         self.album = album
         self.kind = kind
         self.occurrence = occurrence
+        self.id = occurrence == 0 ? baseID : "\(baseID)#\(occurrence)"
+        self.release = album.release
     }
 
-    public var id: String {
-        let base = "\(album.id)/\(track.discNumber)/\(track.trackNumber)/\(track.uri)"
-        return occurrence == 0 ? base : "\(base)#\(occurrence)"
+    /// 不含出現次數的 id，同一張專輯的同一首歌會相同。
+    static func baseID(track: Track, album: Album) -> String {
+        "\(album.id)/\(track.discNumber)/\(track.trackNumber)/\(track.uri)"
     }
-    public var release: ReleaseDate { album.release }
 }
 
 public enum ChronologicalSorter {
@@ -59,6 +68,7 @@ public enum ChronologicalSorter {
         entries.sorted(by: areInIncreasingOrder)
     }
 
+    /// `release` 是建立 entry 時就解析好的，比較時不會重新解析日期字串。
     public static func areInIncreasingOrder(_ a: DiscographyEntry, _ b: DiscographyEntry) -> Bool {
         if a.release != b.release { return a.release < b.release }
         if a.kind != b.kind { return a.kind < b.kind }

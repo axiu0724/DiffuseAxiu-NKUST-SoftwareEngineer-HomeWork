@@ -52,6 +52,10 @@ actor FakePlayer: PlayerAPI {
         current = uri.map { PlaybackState(isPlaying: isPlaying, progressMs: 1000, item: PlayingItem(uri: $0, name: $0, durationMs: 200_000)) }
     }
 
+    func setCurrent(item: PlayingItem, isPlaying: Bool = true) {
+        current = PlaybackState(isPlaying: isPlaying, progressMs: 1000, item: item)
+    }
+
     func setPlayError(_ error: (any Error)?) { playError = error }
     func setStateError(_ error: (any Error)?) { stateError = error }
 

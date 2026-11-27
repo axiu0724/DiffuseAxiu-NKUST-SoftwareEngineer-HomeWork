@@ -165,6 +165,27 @@ struct PlaybackControllerTests {
         #expect(await controller.refresh() == .seconds(3))
     }
 
+    @Test("Spotify 播的是同一首歌在另一個專輯版本上的 URI 時，仍對到清單裡那首，不會離開連續播放")
+    func matchesSameRecordingWithDifferentURI() async {
+        let player = FakePlayer()
+        let controller = PlaybackController(api: player)
+        let list = entries(4)
+        await controller.start(entries: list, at: 0, windowSize: 4)
+
+        let track = list[1].track
+        await player.setCurrent(item: PlayingItem(uri: "spotify:track:other-version", name: track.name,
+                                                  durationMs: track.durationMs, artists: track.artists))
+        for _ in 0..<SequencePlan.startupGraceObservations { await controller.refresh() }
+        #expect(controller.plan?.status == .playing)
+        #expect(controller.currentEntry == list[1])
+
+        // 歌名和藝人一樣但長度不同，就不是同一段錄音：視為使用者換了歌
+        await player.setCurrent(item: PlayingItem(uri: "spotify:track:remix", name: track.name,
+                                                  durationMs: track.durationMs + 1000, artists: track.artists))
+        await controller.refresh()
+        #expect(controller.plan?.status == .detached)
+    }
+
     @Test("背景閒置時開始連續播放，輪詢不用等滿 30 秒，直接改用連續播放的間隔")
     func startReschedulesSlowPolling() async throws {
         let player = FakePlayer()

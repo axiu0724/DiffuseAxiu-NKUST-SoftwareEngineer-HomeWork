@@ -113,6 +113,12 @@ public struct Track: Codable, Sendable, Hashable, Identifiable {
         self.isPlayable = isPlayable
         self.isLocal = isLocal
     }
+
+    /// 是不是同一段錄音。同一張專輯的不同版本 ID 不同，但歌名、長度（毫秒）和主要藝人都一樣。
+    public func isSameRecording(as item: PlayingItem) -> Bool {
+        guard let artistID = artists.first?.id, artistID == item.artists?.first?.id else { return false }
+        return name == item.name && durationMs == item.durationMs
+    }
 }
 
 public struct Paging<Item: Decodable & Sendable>: Decodable, Sendable {
@@ -175,12 +181,12 @@ public struct PlayingItem: Decodable, Sendable, Hashable {
     public let album: PlayingAlbum?
     public let artists: [SimpleArtist]?
 
-    public init(uri: String, name: String, durationMs: Int? = nil) {
+    public init(uri: String, name: String, durationMs: Int? = nil, artists: [SimpleArtist]? = nil) {
         self.uri = uri
         self.name = name
         self.durationMs = durationMs
         self.album = nil
-        self.artists = nil
+        self.artists = artists
     }
 }
 

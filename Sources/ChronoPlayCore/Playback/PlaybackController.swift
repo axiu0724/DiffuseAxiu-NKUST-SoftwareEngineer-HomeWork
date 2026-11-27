@@ -41,6 +41,8 @@ public final class PlaybackController {
     @ObservationIgnored private(set) var nextPollAt: ContinuousClock.Instant?
     /// 別處剛查過狀態、需要更密的輪詢時，輪詢被叫醒後改用這個間隔等待，不重複查詢
     @ObservationIgnored private var rescheduledDelay: Duration?
+    /// entries 裡所有歌的 URI，用來快速判斷 Spotify 回報的歌在不在這份清單裡
+    @ObservationIgnored private var entryURIs: Set<String> = []
 
     public init(api: any PlayerAPI) {
         self.api = api
@@ -56,6 +58,7 @@ public final class PlaybackController {
     public func start(entries: [DiscographyEntry], at index: Int, windowSize: Int) async {
         guard entries.indices.contains(index) else { return }
         self.entries = entries
+        entryURIs = Set(entries.map(\.track.uri))
         let (plan, actions) = SequencePlan.start(uris: entries.map(\.track.uri), at: index, windowSize: windowSize)
         self.plan = plan
         lastError = nil
@@ -78,6 +81,7 @@ public final class PlaybackController {
     public func stopSequence() {
         plan = nil
         entries = []
+        entryURIs = []
     }
 
     // MARK: - 播放控制
@@ -160,7 +164,7 @@ public final class PlaybackController {
         if deviceID == nil, let id = fetched?.device?.id { deviceID = id }
 
         if var plan {
-            let actions = plan.observe(currentURI: fetched?.item?.uri)
+            let actions = plan.observe(currentURI: fetched?.item.map { entryURI(for: $0, in: plan) })
             self.plan = plan
             await perform(actions)
         }
@@ -172,6 +176,18 @@ public final class PlaybackController {
             pollSleepTask?.cancel()
         }
         return delay
+    }
+
+    /// 把 Spotify 回報的歌對回清單裡的 URI。
+    /// 同一張專輯有時有好幾個版本（不同 ID），Spotify 可能播另一個版本的同一首歌，回報的 URI 就對不上，
+    /// 開發模式也不會回傳 linked_from。這時改在已送出的範圍裡找同一段錄音的歌，和 SequencePlan 一樣先往後、再往前找。
+    private func entryURI(for item: PlayingItem, in plan: SequencePlan) -> String {
+        guard plan.status == .playing, !entryURIs.contains(item.uri),
+              plan.windowStart <= plan.currentIndex, plan.currentIndex <= plan.queuedEnd, plan.queuedEnd <= entries.count
+        else { return item.uri }
+        let match = entries[plan.currentIndex..<plan.queuedEnd].first { $0.track.isSameRecording(as: item) }
+            ?? entries[plan.windowStart..<plan.currentIndex].last { $0.track.isSameRecording(as: item) }
+        return match?.track.uri ?? item.uri
     }
 
     private func refreshSoon() async {

@@ -41,17 +41,35 @@ struct SpotifyClientTests {
         #expect(CountingPagingProtocol.maxInFlight.withLock { $0 } <= SpotifyClient.maxConcurrentRequests)
     }
 
-    @Test("Spotify 要求等很久時直接報錯並說要等多久，之後的請求也不再送出")
+    @Test("額度用完要等很久時直接報錯並說要等多久；同一組不再送出請求，其他組照常送出")
     func longRateLimitFailsFast() async throws {
         let client = client(using: RateLimitedProtocol.self)
 
         let error = await #expect(throws: SpotifyAPIError.self) { try await client.myPlaylists() }
         #expect(error?.status == 429)
         #expect(error?.retryAfter == .seconds(600))
+        #expect(error?.errorDescription?.contains("用量額度") == true)
         #expect(error?.errorDescription?.contains("10 分鐘") == true)
 
-        await #expect(throws: SpotifyAPIError.self) { try await client.currentUserID() }
+        // 同一組：不送出請求，錯誤仍說明是額度用完
+        let again = await #expect(throws: SpotifyAPIError.self) { try await client.myPlaylists() }
+        #expect(again?.reason == "QUOTA_EXCEEDED")
         #expect(RateLimitedProtocol.requests.withLock { $0 } == 1)
+
+        // 別組（播放狀態）不受影響，照常送出
+        await #expect(throws: SpotifyAPIError.self) { try await client.playbackState() }
+        #expect(RateLimitedProtocol.requests.withLock { $0 } == 2)
+    }
+
+    @Test("額度分組依路徑的第一段，me/ 底下再多看一段")
+    func quotaGroups() {
+        func group(_ path: String) -> String { SpotifyClient.quotaGroup(for: SpotifyClient.baseURL.appending(path: path)) }
+        #expect(group("artists/x/albums") == "artists")
+        #expect(group("albums/x/tracks") == "albums")
+        #expect(group("me/player") == "me/player")
+        #expect(group("me/player/queue") == "me/player")
+        #expect(group("me/playlists") == "me/playlists")
+        #expect(group("me") == "me")
     }
 }
 
@@ -72,7 +90,7 @@ final class CountingPagingProtocol: PagingProtocol, @unchecked Sendable {
     }
 }
 
-/// 每個請求都回 429、Retry-After 600 秒，並記錄收到幾個請求。
+/// 每個請求都回 429（額度用完）、Retry-After 600 秒，並記錄收到幾個請求。
 final class RateLimitedProtocol: URLProtocol, @unchecked Sendable {
     static let requests = Mutex(0)
 
@@ -83,7 +101,7 @@ final class RateLimitedProtocol: URLProtocol, @unchecked Sendable {
         Self.requests.withLock { $0 += 1 }
         let response = HTTPURLResponse(url: request.url!, statusCode: 429, httpVersion: nil, headerFields: ["Retry-After": "600"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(#"{"error":{"status":429,"message":"API rate limit exceeded"}}"#.utf8))
+        client?.urlProtocol(self, didLoad: Data(#"{"error":{"status":429,"message":"Too many requests","reason":"QUOTA_EXCEEDED"}}"#.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
 

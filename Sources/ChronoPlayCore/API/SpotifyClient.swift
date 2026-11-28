@@ -19,24 +19,34 @@ public struct SpotifyAPIError: LocalizedError, Sendable {
             return "這個 Spotify 帳號不在開發者 app 的使用者名單中，請到 Spotify Dashboard 的 User Management 加入。"
         }
         if status == 429 {
+            // 開發模式有兩種限制：短時間內請求太多（速率限制），以及某類 API 的用量額度用完（QUOTA_EXCEEDED）
+            let what = reason == "QUOTA_EXCEEDED"
+                ? "這類資料的 Spotify 開發模式用量額度暫時用完了。"
+                : "請求太頻繁，Spotify 暫時拒絕。"
             guard let seconds = retryAfter?.components.seconds, seconds > 60 else {
-                return "請求太頻繁，Spotify 暫時拒絕。請稍後再試。"
+                return what + "請稍後再試。"
             }
             let minutes = (seconds + 59) / 60
             let wait = minutes < 120 ? "\(minutes) 分鐘" : "\((minutes + 59) / 60) 小時"
-            return "請求太頻繁，Spotify 暫時拒絕。大約 \(wait)後再試。"
+            return what + "大約 \(wait)後再試。"
         }
         return "Spotify 回應錯誤（HTTP \(status)）：\(message)"
     }
 }
 
-/// 所有請求共用的閘門：限制同時進行的請求數，並在 Spotify 回 429 後讓所有請求一起等，不要各自去撞限流。
+/// 所有請求共用的閘門：限制同時進行的請求數，並在 Spotify 回 429 後讓同一組的請求一起等，不要各自去撞限流。
 /// Spotify 是用 30 秒的滾動視窗計算請求數，請求越集中越容易超過上限，所以不管呼叫端有幾層並行，總數都由這裡控制。
+/// 開發模式的用量額度則是依 API 分桶計算，所以被擋時只擋同一組（見 `SpotifyClient.quotaGroup`）。
 actor RequestGate {
+    struct Block {
+        let until: ContinuousClock.Instant
+        let reason: String?
+    }
+
     private let limit: Int
     private var running = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
-    private var blockedUntil: ContinuousClock.Instant?
+    private var blocks: [String: Block] = [:]
 
     init(limit: Int) { self.limit = limit }
 
@@ -57,22 +67,26 @@ actor RequestGate {
         }
     }
 
-    func block(for duration: Duration) {
+    func block(_ group: String, for duration: Duration, reason: String?) {
         let until = ContinuousClock.now + duration
-        if blockedUntil.map({ until > $0 }) ?? true { blockedUntil = until }
+        if blocks[group].map({ until > $0.until }) ?? true { blocks[group] = Block(until: until, reason: reason) }
     }
 
-    /// 還要等多久才能再送請求；沒有被限流時回傳 nil。
-    func remainingBlock() -> Duration? {
-        guard let blockedUntil else { return nil }
-        let remaining = blockedUntil - .now
-        return remaining > .zero ? remaining : nil
+    /// 這一組還要等多久才能再送請求，以及被擋的原因；沒有被擋時回傳 nil。
+    func remainingBlock(_ group: String) -> (Duration, reason: String?)? {
+        guard let block = blocks[group] else { return nil }
+        let remaining = block.until - .now
+        guard remaining > .zero else {
+            blocks[group] = nil
+            return nil
+        }
+        return (remaining, block.reason)
     }
 }
 
 /// Spotify Web API 的精簡 client。
 /// - 401：自動 refresh token 後重試一次。
-/// - 429：所有請求一起依 Retry-After 等待後重試（最多 3 次）；要等超過 30 秒就直接報錯，告訴使用者要等多久。
+/// - 429：同一組的請求一起依 Retry-After 等待後重試（最多 3 次）；要等超過 30 秒就直接報錯，告訴使用者要等多久。
 /// - 同時進行的請求最多 4 個。
 /// - 有分頁的 endpoint 會沿著 `next` 抓完全部。
 public final class SpotifyClient: Sendable {
@@ -109,9 +123,10 @@ public final class SpotifyClient: Sendable {
     private func send(_ method: String, _ url: URL, json: (any Encodable & Sendable)? = nil) async throws -> Data {
         var didRefresh = false
         var rateLimitRetries = 0
+        let group = Self.quotaGroup(for: url)
 
         while true {
-            try await waitForRateLimit()
+            try await waitForRateLimit(group)
             let token = didRefresh ? try await tokens.forceRefresh() : try await tokens.validAccessToken()
             var request = URLRequest(url: url)
             request.httpMethod = method
@@ -143,12 +158,10 @@ public final class SpotifyClient: Sendable {
                 continue
             case 429:
                 let retryAfter = Duration.seconds(Double(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 2)
-                await gate.block(for: retryAfter)
-                guard rateLimitRetries < 3, retryAfter <= Self.maxRateLimitWait else {
-                    var error = Self.apiError(status: 429, data: data)
-                    error.retryAfter = retryAfter
-                    throw error
-                }
+                var error = Self.apiError(status: 429, data: data)
+                error.retryAfter = retryAfter
+                await gate.block(group, for: retryAfter, reason: error.reason)
+                guard rateLimitRetries < 3, retryAfter <= Self.maxRateLimitWait else { throw error }
                 rateLimitRetries += 1
                 continue  // 下一輪開頭會等到限流解除
             default:
@@ -157,13 +170,23 @@ public final class SpotifyClient: Sendable {
         }
     }
 
-    /// 被限流時先等到解除再送；要等太久就不送了，直接報錯。
-    private func waitForRateLimit() async throws {
-        guard let remaining = await gate.remainingBlock() else { return }
+    /// 這一組被限流時先等到解除再送；要等太久就不送了，直接報錯。
+    private func waitForRateLimit(_ group: String) async throws {
+        guard let (remaining, reason) = await gate.remainingBlock(group) else { return }
         guard remaining <= Self.maxRateLimitWait else {
-            throw SpotifyAPIError(status: 429, message: "Too many requests", reason: nil, retryAfter: remaining)
+            throw SpotifyAPIError(status: 429, message: "Too many requests", reason: reason, retryAfter: remaining)
         }
         try await Task.sleep(for: remaining)
+    }
+
+    /// Spotify 把 API 分成好幾個用量額度桶，但沒有公開怎麼分。這裡用路徑的第一段粗略分組
+    /// （`me/` 底下再多看一段），例如 artists、albums、me/player、me/playlists、playlists、search。
+    /// 一組被擋時只讓同一組等，藝人作品的額度用完，播放控制和清單照樣能用。
+    static func quotaGroup(for url: URL) -> String {
+        let parts = url.path().split(separator: "/").dropFirst()  // 去掉 v1
+        guard let first = parts.first else { return "" }
+        if first == "me", parts.count > 1 { return "me/\(parts[parts.index(after: parts.startIndex)])" }
+        return String(first)
     }
 
     static func apiError(status: Int, data: Data) -> SpotifyAPIError {
